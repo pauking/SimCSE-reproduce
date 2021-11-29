@@ -1,4 +1,5 @@
 from re import template
+from torch.nn.modules.activation import GELU
 from transformers import (
     AutoModel, 
     AutoTokenizer
@@ -168,28 +169,6 @@ class WeightedSampler(nn.Module):
             hidden_states * w.unsqueeze(0).unsqueeze(-1)
         )
 
-class SGLossBase(nn.Module):
-    """
-    basement loss in "Self-Guided Contrastive Learning for BERT Sentence Representations"
-    """
-    def __init__(self, temp):
-        super().__init__()
-        self.temp = temp
-
-    def forward(self):
-        raise NotImplementedError()
-
-class SGLossOpt1(nn.Module):
-    """
-    Opt1 loss in "Self-Guided Contrastive Learning for BERT Sentence Representations"
-    """
-    def __init__(self, temp):
-        super().__init__()
-        self.temp = temp
-
-    def forward(self):
-        raise NotImplementedError()
-
 class SGLossOpt2(nn.Module):
     """
     Exactly the same loss func with Unsupervised SimCSE
@@ -251,7 +230,7 @@ class SGLossOpt3(nn.Module):
             for k in range(layer_num):
                 loss_list.append(
                     - torch.log(sim_ci_hik[i, k]) \
-                    + torch.log(sim_ci_hik[i, k] + sim_ci_hmn[i].sum())
+                    + torch.log(sim_ci_hik[i, k] + sim_after_mask[i].sum())
                 )
         return torch.stack(loss_list).mean()
         
@@ -314,36 +293,97 @@ class SGLossOpt3Simplified(nn.Module):
         # )
         return loss1 + loss2
 
-class RegLoss(nn.Module):
-    def __init__(self, lamb):
+class RegHiddenLoss(nn.Moduke):
+    def __init__(self):
         super().__init__()
-        self.lamb = lamb
     
-    def forward(self):
-        raise NotImplementedError()
+    def forward(self, hidden1, hidden2):
+        #input: hidden_states(tuple of tensor)
+        #output: loss
+        param_list = []
+        for h1, h2 in zip(hidden1, hidden2):
+            h = (h1 - h2).reshape(-1).pow(2).sum()
+            param_list.append(h)
+        
+        return torch.sum(torch.stack(param_list)).sqrt()
+
+class RegLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, param1, param2):
+        #input: model.encoder.parameters()
+        #output: loss
+        param_list = []
+        for part1, part2 in zip(param1, param2):
+            param = (part1 - part2).reshape(-1).pow(2).sum()
+            param_list.append(param)
+        
+        return torch.sum(torch.stack(param_list)).sqrt()
+
+class TotalLoss(nn.Module):
+    def __init__(self, sgloss, sampler, regloss, lamb=0.1):
+        self.sgloss = sgloss
+        self.sampler = sampler
+        self.regloss = regloss
+        self.lamb = 0.1
+    
+    def forward(self, cls, hiddens, p1, p2):
+        """
+        cls: [batch, hidden]
+        hiddens: [batch, layers, hidden]
+        """
+        if not isinstance(self.sgloss, (SGLossOpt3, SGLossOpt3Simplified)):
+            hiddens = self.sampler(hiddens)
+        
+        return self.sgloss(cls, hiddens) + self.lamb * self.regloss(p1, p2)
+
 
 class SelfGuidedContraModel(nn.Module):
-    def __init__(self):
+    def __init__(self, model_name, total_loss, hidden):
         super.__init__()
-    
-    def forward(self, cls, hidden):
-        """
-        cls:[batch_size, hidden_dim]
-        hidden:[batch_size, layer_num, hidden_dim]
-        return loss, sim
-        """
-        raise NotImplementedError()
+        self.bertF = AutoModel.from_pretrained(model_name)
+        self.bertT = AutoModel.from_pretrained(model_name)
+        self.proj = nn.Sequential(
+            nn.Linear(hidden, 4096),
+            nn.GELU(),
+            nn.Linear(4096, hidden),
+            nn.GELU()
+        )
+        self.loss_fn = total_loss
+        self._freeze_param()
 
 
+    def _freeze_param(self):
+        for name, param in self.bertT.encoder.named_parameters():
+            if 'layer.0' in name:
+                param.requires_grad_(False)
+        
+        for name, param in self.bertF.encoder.named_parameters():
+            param.requires_grad_(False)
 
 
+    def forward(self, input_ids, attention_mask, token_type_ids=None, labels=None, inputs_embeds=None):
+       
+        #[batch_size, hidden_dim]
+        pooler_output = self.bertT(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids
+        ).pooler_output
+        pooler_output = self.proj(pooler_output)
 
-class SGLossBase(nn.Module):
-    """
-    basement loss in "Self-Guided Contrastive Learning for BERT Sentence Representations"
-    """
-    def __init__(self):
-        pass
+        #[batch_size, layers, hidden_dim]
+        hiddens = self.bertF(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids
+        )
+        hiddens = self.proj(hiddens)
+
+        loss = self.loss_fn(pooler_output, hiddens, self.bertT.parameters(), self.bertF.parameters())
+        
+        return loss
 
 
 
